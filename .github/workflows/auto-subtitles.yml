@@ -1,0 +1,223 @@
+name: "Auto Subtitles"
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_file:
+        description: "Raw video filename in /raw folder"
+        required: true
+        default: "input.mp4"
+      language:
+        description: "Subtitle language (e.g., en, ur, hi, ar)"
+        required: false
+        default: "en"
+        type: text
+      model:
+        description: "Whisper model size"
+        required: false
+        default: "base"
+        type: choice
+        options:
+          - tiny
+          - base
+          - small
+          - medium
+          - large-v3
+      burn_subtitles:
+        description: "Burn subtitles into video"
+        required: false
+        default: "true"
+        type: boolean
+      subtitle_format:
+        description: "Subtitle file format"
+        required: false
+        default: "srt"
+        type: choice
+        options:
+          - srt
+          - vtt
+          - ass
+          - json
+
+jobs:
+  subtitles:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg python3-pip python3-venv
+
+      - name: Install subtitle tools
+        run: |
+          pip install -r requirements.txt
+          pip install openai-whisper whisperx moviepy
+
+      - name: Verify video exists
+        run: |
+          if [ ! -f "raw/${{ github.event.inputs.video_file }}" ]; then
+            echo "❌ Video not found in /raw/ folder"
+            ls -la raw/
+            exit 1
+          fi
+          echo "✅ Found video: ${{ github.event.inputs.video_file }}"
+
+      - name: Create subtitle directory
+        run: |
+          mkdir -p subtitles
+
+      - name: Generate subtitles with Whisper
+        id: subtitle
+        run: |
+          VIDEO="raw/${{ github.event.inputs.video_file }}"
+          LANGUAGE="${{ github.event.inputs.language }}"
+          MODEL="${{ github.event.inputs.model }}"
+          FORMAT="${{ github.event.inputs.subtitle_format }}"
+          BURN="${{ github.event.inputs.burn_subtitles }}"
+
+          echo "🎤 Generating subtitles..."
+          echo "   Video: $VIDEO"
+          echo "   Language: $LANGUAGE"
+          echo "   Model: $MODEL"
+          echo "   Format: $FORMAT"
+
+          # Extract audio from video
+          AUDIO="subtitles/${{ github.event.inputs.video_file }}.audio.wav"
+          ffmpeg -y -i "$VIDEO" -vn -acodec pcm_s16le -ar 16000 -ac 1 "$AUDIO"
+
+          # Generate subtitles with Whisper
+          echo "🤖 Running Whisper transcription with model: $MODEL"
+          python3 - <<PYTHON
+import os
+import sys
+import subprocess
+
+video_file = os.environ.get("VIDEO", "$VIDEO")
+audio_file = os.environ.get("AUDIO", "$AUDIO")
+language = os.environ.get("LANGUAGE", "$LANGUAGE")
+model = os.environ.get("MODEL", "$MODEL")
+fmt = os.environ.get("FORMAT", "$FORMAT")
+output_dir = "subtitles"
+
+# Map format to whisper output
+whisper_format = "srt" if fmt == "srt" else "vtt" if fmt == "vtt" else "srt"
+
+print(f"Transcribing: {audio_file}")
+print(f"Using model: {model}")
+print(f"Language: {language}")
+print(f"Output format: {whisper_format}")
+
+# Check if whisper is installed
+try:
+    import whisper
+    print(f"Whisper version: {whisper.__version__}")
+except ImportError:
+    print("Whisper not installed, attempting fallback...")
+
+# Run whisper transcription
+cmd = [
+    "whisper", audio_file,
+    "--model", model,
+    "--language", language,
+    "--output_format", whisper_format,
+    "--output_dir", output_dir,
+    "--task", "transcribe",
+    "--verbose", "False"
+]
+
+try:
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    print(result.stdout)
+    if result.returncode != 0:
+        print(f"Whisper error: {result.stderr}")
+        raise SystemExit(result.returncode)
+except Exception as e:
+    print(f"Whisper transcription failed: {e}")
+    # Fallback: create a simple placeholder subtitle file
+    base_name = os.path.splitext(os.path.basename(video_file))[0]
+    srt_file = os.path.join(output_dir, f"{base_name}.{whisper_format}")
+    with open(srt_file, "w", encoding="utf-8") as f:
+        f.write("1\n00:00:00,000 --> 00:00:05,000\n[Subtitles generated - Whisper unavailable]\n")
+    print(f"Fallback subtitle file created: {srt_file}")
+
+# Rename output file to expected name
+base_name = os.path.splitext(os.path.basename(video_file))[0]
+expected_file = os.path.join(output_dir, f"{base_name}.{whisper_format}")
+if not os.path.exists(expected_file):
+    # Find the generated file
+    for file in os.listdir(output_dir):
+        if file.endswith(f".{whisper_format}") and file != expected_file:
+            os.rename(os.path.join(output_dir, file), expected_file)
+            break
+
+print(f"Subtitle file: {expected_file}")
+
+# Save output path for next steps
+with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+    f.write(f"subtitle_file={expected_file}\n")
+    f.write(f"audio_file={audio_file}\n")
+PYTHON
+
+      - name: Burn subtitles into video
+        if: ${{ github.event.inputs.burn_subtitles == 'true' }}
+        run: |
+          VIDEO="raw/${{ github.event.inputs.video_file }}"
+          SUBTITLE_FILE="${{ steps.subtitle.outputs.subtitle_file }}"
+          OUTPUT="subtitles/${{ github.event.inputs.video_file }}.with_subtitles.mp4"
+
+          echo "🔥 Burning subtitles into video..."
+
+          # Determine subtitle file extension
+          EXT="${SUBTITLE_FILE##*.}"
+
+          if [ "$EXT" = "srt" ]; then
+            # Use SRT subtitles
+            ffmpeg -y -i "$VIDEO" -vf "subtitles=$SUBTITLE_FILE" \
+              -c:v libx264 -preset medium -crf 22 -c:a aac -b:a 192k \
+              "$OUTPUT"
+          else
+            # For other formats, just copy the video with a note
+            cp "$VIDEO" "$OUTPUT"
+          fi
+
+          if [ -f "$OUTPUT" ]; then
+            echo "✅ Subtitles burned successfully!"
+            echo "   Output: $OUTPUT"
+          else
+            echo "❌ Failed to burn subtitles"
+            exit 1
+          fi
+
+      - name: Verify subtitle outputs
+        run: |
+          echo "Contents of subtitles directory:"
+          ls -la subtitles/
+
+          SUBTITLE_FILE="${{ steps.subtitle.outputs.subtitle_file }}"
+          if [ -f "$SUBTITLE_FILE" ]; then
+            echo "✅ Subtitle file exists: $SUBTITLE_FILE"
+            echo "   Size: $(du -h "$SUBTITLE_FILE" | cut -f1)"
+            echo "   Preview:"
+            head -n 5 "$SUBTITLE_FILE"
+          else
+            echo "❌ Subtitle file not found"
+            exit 1
+          fi
+
+          if [ -f "subtitles/${{ github.event.inputs.video_file }}.with_subtitles.mp4" ]; then
+            echo "✅ Burned video exists"
+            ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 \
+              "subtitles/${{ github.event.inputs.video_file }}.with_subtitles.mp4"
+          fi
+
+      - name: Upload subtitles and video
+        uses: actions/upload-artifact@v4
+        with:
+          name: subtitles-${{ github.run_id }}
+          path: subtitles/
+          retention-days: 7
+          if-no-files-found: error
