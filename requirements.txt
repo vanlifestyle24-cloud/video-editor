@@ -1,0 +1,7 @@
+moviepy
+numpy
+opencv-python-headless
+pydub
+librosa
+speechrecognition
+gradio
