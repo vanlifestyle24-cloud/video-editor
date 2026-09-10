@@ -1,0 +1,77 @@
+name: "AI Video Editor"
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_file:
+        description: "Raw video filename"
+        required: true
+        default: "input.mp4"
+      instructions:
+        description: "Edit instructions (e.g., 'remove filler words, add subtitles, color grade to warm cinematic')"
+        required: true
+        default: "Process video for YouTube Shorts format"
+
+jobs:
+  ai-edit:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg yt-dlp python3-pip
+
+      - name: Install video editing tools
+        run: |
+          pip install -r requirements.txt
+          git clone https://github.com/dygnora/video-use tools/video-use
+          git clone https://github.com/jazzerkay/montaj tools/montaj
+          cd tools/montaj
+          pip install -e .
+          montaj install whisper
+          montaj install ui
+
+      - name: Verify video exists
+        run: |
+          if [ ! -f "raw/${{ github.event.inputs.video_file }}" ]; then
+            echo "❌ Video not found in /raw/ folder"
+            ls -la raw/
+            exit 1
+          fi
+          echo "✅ Found video: ${{ github.event.inputs.video_file }}"
+
+      - name: Run video-use pipeline
+        run: |
+          mkdir -p edited
+
+          # Transcribe the video
+          python tools/video-use/helpers/transcribe.py \
+            "raw/${{ github.event.inputs.video_file }}" \
+            -o "edited/${{ github.event.inputs.video_file }}.transcript.json" || true
+
+          # Render final video using video-use helpers
+          python tools/video-use/helpers/render.py \
+            "edited/${{ github.event.inputs.video_file }}.transcript.json" \
+            -o "edited/${{ github.event.inputs.video_file }}.ai-final.mp4" \
+            --build-subtitles || true
+
+          # Fallback: if video-use fails, use FFmpeg
+          if [ ! -f "edited/${{ github.event.inputs.video_file }}.ai-final.mp4" ]; then
+            echo "video-use rendering failed, using FFmpeg fallback..."
+            ffmpeg -y -i "raw/${{ github.event.inputs.video_file }}" \
+              -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1" \
+              -c:v libx264 -preset medium -crf 22 -c:a aac -b:a 128k \
+              "edited/${{ github.event.inputs.video_file }}.ai-final.mp4"
+          fi
+
+      - name: Upload AI edited video
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-edited-video-${{ github.run_id }}
+          path: edited/
+          retention-days: 7
+          if-no-files-found: error
